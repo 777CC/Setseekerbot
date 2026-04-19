@@ -6,6 +6,7 @@ from utils.helpers import (
     format_thai_baht,
 )
 from utils.notifier import Notifier
+from utils import state_store
 
 __all__ = [
     "get_tick_size",
@@ -14,4 +15,5 @@ __all__ = [
     "is_market_hours",
     "format_thai_baht",
     "Notifier",
+    "state_store",
 ]

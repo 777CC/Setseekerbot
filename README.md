@@ -10,6 +10,7 @@ Automated day trading bot for the **Stock Exchange of Thailand (SET)** using qua
 Setseekerbot/
 ├── main.py                  # Entry point (trade / backtest / status)
 ├── bot.py                   # Main orchestrator
+├── dashboard.py             # Streamlit live dashboard
 ├── config/
 │   └── settings.py          # All parameters (risk, strategy, broker)
 ├── data/
@@ -30,7 +31,8 @@ Setseekerbot/
 │   └── report.py            # Console tables + plotly equity charts
 └── utils/
     ├── helpers.py            # SET tick sizes, commission calc
-    └── notifier.py           # LINE Notify trade alerts
+    ├── notifier.py           # LINE Notify trade alerts
+    └── state_store.py        # Thread-safe JSON state (bot → dashboard)
 ```
 
 ---
@@ -74,16 +76,20 @@ cp .env.example .env
 # 3. Run in paper trading mode (default — no credentials needed)
 python main.py
 
-# 4. Run backtest on all watchlist symbols
+# 4. Open the live dashboard (in a separate terminal)
+streamlit run dashboard.py
+# → http://localhost:8501
+
+# 5. Run backtest on all watchlist symbols
 python main.py --backtest
 
-# 5. Backtest a single symbol
+# 6. Backtest a single symbol
 python main.py --backtest ADVANC
 
-# 6. Print current portfolio status
+# 7. Print current portfolio status
 python main.py --status
 
-# 7. Live trading (requires valid broker credentials)
+# 8. Live trading (requires valid broker credentials)
 python main.py --live
 ```
 

@@ -20,6 +20,7 @@ from strategies.composite import CompositeStrategy
 from strategies.base import SignalType
 from utils.helpers import is_market_hours, format_thai_baht
 from utils.notifier import Notifier
+from utils import state_store
 
 
 class SETTradingBot:
@@ -48,6 +49,17 @@ class SETTradingBot:
         logger.info(f"SETTradingBot initialized | Mode: {mode} | "
                     f"Capital: {format_thai_baht(settings.trading.initial_capital)}")
 
+        # Initialise state store
+        state_store.save({
+            **state_store._default_state(),
+            "mode": mode.lower(),
+            "initial_capital": settings.trading.initial_capital,
+            "cash": settings.trading.initial_capital,
+            "peak_equity": settings.trading.initial_capital,
+            "watchlist": settings.trading.watchlist,
+            "running": False,
+        })
+
     # ------------------------------------------------------------------
     # Core trading loop
     # ------------------------------------------------------------------
@@ -56,6 +68,7 @@ class SETTradingBot:
         """Start the trading bot with scheduled jobs."""
         logger.info("Starting SETTradingBot...")
         self.running = True
+        state_store.update({"running": True})
 
         if not self.settings.paper_trading:
             authenticated = self.data.authenticate()
@@ -182,6 +195,14 @@ class SETTradingBot:
                     f"Signal: BUY {symbol} @ ฿{sig.price:.2f} | "
                     f"Strength: {sig.strength:.2f} | {sig.reason}"
                 )
+                state_store.append_signal({
+                    "time": datetime.now().isoformat(),
+                    "symbol": symbol,
+                    "type": "BUY",
+                    "price": sig.price,
+                    "strength": sig.strength,
+                    "reason": sig.reason,
+                })
                 self._enter_position(sig, df)
 
     # ------------------------------------------------------------------
@@ -296,6 +317,46 @@ class SETTradingBot:
     def _record_equity(self):
         """Snapshot portfolio equity."""
         self.portfolio.record_equity(self._last_prices)
+        equity = self.portfolio.get_total_equity(self._last_prices)
+        state_store.append_equity(datetime.now().isoformat(), equity)
+        state_store.update({
+            "cash": self.portfolio.cash,
+            "daily_pnl": self.risk.daily_pnl,
+            "daily_trades": self.risk.daily_trades,
+            "peak_equity": self.risk.peak_equity,
+            "positions": {
+                sym: {
+                    "side": pos.side,
+                    "entry_price": pos.entry_price,
+                    "quantity": pos.quantity,
+                    "stop_loss": pos.stop_loss,
+                    "take_profit": pos.take_profit,
+                    "strategy": pos.strategy,
+                    "entry_time": pos.entry_time.isoformat(),
+                    "current_price": self._last_prices.get(sym, pos.entry_price),
+                    "unrealized_pnl": pos.unrealized_pnl(
+                        self._last_prices.get(sym, pos.entry_price)
+                    ),
+                }
+                for sym, pos in self.portfolio.positions.items()
+            },
+            "closed_trades": [
+                {
+                    "symbol": t.symbol,
+                    "side": t.side,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "quantity": t.quantity,
+                    "pnl": t.pnl,
+                    "pnl_pct": t.pnl_pct,
+                    "strategy": t.strategy,
+                    "reason": t.reason,
+                    "entry_time": t.entry_time.isoformat(),
+                    "exit_time": t.exit_time.isoformat(),
+                }
+                for t in self.portfolio.closed_trades[-100:]
+            ],
+        })
 
     # ------------------------------------------------------------------
     # Reporting
@@ -326,6 +387,7 @@ class SETTradingBot:
     def _shutdown(self):
         """Graceful shutdown."""
         logger.info("Shutting down bot...")
+        state_store.update({"running": False})
         if self.portfolio.positions:
             logger.warning(
                 f"Warning: {len(self.portfolio.positions)} open positions not closed."
