@@ -9,6 +9,8 @@ build/
 venv/
 data/cache/
 data/logs/
+data/bot_state.json
+data/bot_state.tmp
 *.log
 .idea/
 .vscode/
