@@ -1,70 +1,69 @@
 """
-SetseekerBot — Live Dashboard
+SetseekerBot — Dashboard (Live + Backtest)
 Run with:  streamlit run dashboard.py
 
-Reads from data/bot_state.json written by the trading bot.
-Auto-refreshes every 10 seconds.
+Pages:
+  • Live Trading — real-time portfolio view (auto-refresh every 10s)
+  • Backtest     — run strategies against historical/simulated data
 """
 
 from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
+from config.settings import Settings, StrategyConfig
+from data.market_data import MarketDataFetcher
+from backtest.engine import BacktestEngine, BacktestResult
+from strategies.composite import CompositeStrategy
+from strategies.momentum import MomentumStrategy
+from strategies.mean_reversion import MeanReversionStrategy
+from strategies.breakout import BreakoutStrategy
+from strategies.vwap_strategy import VWAPStrategy
 from utils import state_store
 
-# ── Page config ────────────────────────────────────────────────────────────────
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SetseekerBot Dashboard",
+    page_title="SetseekerBot",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Auto-refresh ───────────────────────────────────────────────────────────────
-REFRESH_SECS = 10
-st.markdown(
-    f"""
-    <meta http-equiv="refresh" content="{REFRESH_SECS}">
-    <style>
-        .metric-card {{
-            background: #1e1e2e;
-            border-radius: 10px;
-            padding: 16px 20px;
-            margin-bottom: 8px;
-        }}
-        .pos-pnl  {{ color: #50fa7b; font-weight: bold; }}
-        .neg-pnl  {{ color: #ff5555; font-weight: bold; }}
-        .neutral  {{ color: #f8f8f2; }}
-        div[data-testid="stMetricValue"] > div {{ font-size: 1.6rem; }}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ── Load state ─────────────────────────────────────────────────────────────────
-state = state_store.load()
+_CSS = """
+<style>
+    .pos-pnl { color: #50fa7b; font-weight: bold; }
+    .neg-pnl { color: #ff5555; font-weight: bold; }
+    div[data-testid="stMetricValue"] > div { font-size: 1.6rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #1e1e2e; border-radius: 6px; padding: 8px 16px;
+    }
+    .stTabs [aria-selected="true"] { background: #44475a; }
+</style>
+"""
+st.markdown(_CSS, unsafe_allow_html=True)
 
 
 def _fmt_thb(v: float) -> str:
     return f"฿{v:,.2f}"
 
 
-def _pnl_color(v: float) -> str:
-    return "pos-pnl" if v >= 0 else "neg-pnl"
-
-
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+# ── Sidebar: navigation ────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📈 SetseekerBot")
+    page = st.radio("Navigation", ["🔴 Live Trading", "🧪 Backtest", "⚙️ Settings"],
+                    label_visibility="collapsed")
+
+    st.divider()
+    state = state_store.load()
     mode = state.get("mode", "paper").upper()
     running = state.get("running", False)
-
-    status_icon = "🟢 Running" if running else "🔴 Stopped"
-    st.markdown(f"**Status:** {status_icon}")
+    st.markdown(f"**Bot status:** {'🟢 Running' if running else '🔴 Stopped'}")
     st.markdown(f"**Mode:** `{mode}`")
-
     last_updated = state.get("last_updated")
     if last_updated:
         try:
@@ -73,274 +72,445 @@ with st.sidebar:
         except Exception:
             pass
 
-    st.divider()
-    st.caption(f"Auto-refresh every {REFRESH_SECS}s")
-    if st.button("🔄 Refresh now"):
-        st.rerun()
 
-# ── Top KPI row ────────────────────────────────────────────────────────────────
-initial_capital = state.get("initial_capital", 0.0)
-cash = state.get("cash", 0.0)
-daily_pnl = state.get("daily_pnl", 0.0)
-daily_trades = state.get("daily_trades", 0)
-positions = state.get("positions", {})
-closed_trades = state.get("closed_trades", [])
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE TRADING PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+def render_live():
+    # Auto-refresh ONLY on live page
+    st.markdown('<meta http-equiv="refresh" content="10">', unsafe_allow_html=True)
+    st.header("Live Trading")
 
-# Calculate total equity (cash + unrealized)
-unrealized_total = sum(
-    p.get("unrealized_pnl", 0.0) for p in positions.values()
-)
-total_equity = cash + sum(
-    p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
-    for p in positions.values()
-)
+    initial_capital = state.get("initial_capital", 0.0)
+    cash = state.get("cash", 0.0)
+    daily_pnl = state.get("daily_pnl", 0.0)
+    daily_trades = state.get("daily_trades", 0)
+    positions = state.get("positions", {})
+    closed_trades = state.get("closed_trades", [])
 
-total_return_pct = (
-    (total_equity - initial_capital) / initial_capital * 100
-    if initial_capital > 0 else 0.0
-)
-
-# Win rate from closed trades
-wins = [t for t in closed_trades if t.get("pnl", 0) > 0]
-win_rate = len(wins) / len(closed_trades) * 100 if closed_trades else 0.0
-realized_pnl = sum(t.get("pnl", 0) for t in closed_trades)
-
-st.subheader("Portfolio Overview")
-col1, col2, col3, col4, col5, col6 = st.columns(6)
-
-col1.metric("Total Equity", _fmt_thb(total_equity),
-            f"{total_return_pct:+.2f}%")
-col2.metric("Cash", _fmt_thb(cash))
-col3.metric("Daily P&L", _fmt_thb(daily_pnl),
-            f"{daily_pnl / initial_capital * 100:+.2f}%" if initial_capital else None,
-            delta_color="normal")
-col4.metric("Unrealized P&L", _fmt_thb(unrealized_total),
-            delta_color="normal")
-col5.metric("Trades Today", str(daily_trades))
-col6.metric("Win Rate", f"{win_rate:.1f}%",
-            f"{len(wins)}/{len(closed_trades)} trades")
-
-st.divider()
-
-# ── Equity Curve ───────────────────────────────────────────────────────────────
-equity_history = state.get("equity_history", [])
-
-left, right = st.columns([3, 1])
-
-with left:
-    st.subheader("Equity Curve")
-    if equity_history:
-        times = [row[0] for row in equity_history]
-        values = [row[1] for row in equity_history]
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=times, y=values,
-            mode="lines",
-            name="Portfolio Value",
-            line=dict(color="#50fa7b", width=2),
-            fill="tozeroy",
-            fillcolor="rgba(80,250,123,0.07)",
-        ))
-        if initial_capital:
-            fig.add_hline(
-                y=initial_capital,
-                line_dash="dash",
-                line_color="#6272a4",
-                annotation_text="Initial Capital",
-                annotation_position="top left",
-            )
-        fig.update_layout(
-            template="plotly_dark",
-            height=320,
-            margin=dict(l=0, r=0, t=10, b=0),
-            xaxis_title=None,
-            yaxis_title="฿",
-            showlegend=False,
-            xaxis=dict(showgrid=False),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No equity history yet — start the bot to populate data.")
-
-# ── Daily P&L bar per trade ────────────────────────────────────────────────────
-with right:
-    st.subheader("Trade P&L")
-    if closed_trades:
-        recent = closed_trades[-20:]
-        pnls = [t.get("pnl", 0) for t in recent]
-        symbols = [t.get("symbol", "") for t in recent]
-        colors = ["#50fa7b" if p > 0 else "#ff5555" for p in pnls]
-
-        fig2 = go.Figure(go.Bar(
-            x=list(range(len(pnls))),
-            y=pnls,
-            marker_color=colors,
-            text=symbols,
-            textposition="outside",
-        ))
-        fig2.update_layout(
-            template="plotly_dark",
-            height=320,
-            margin=dict(l=0, r=0, t=10, b=0),
-            xaxis=dict(showticklabels=False),
-            yaxis_title="฿",
-            showlegend=False,
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("No closed trades yet.")
-
-st.divider()
-
-# ── Open Positions ─────────────────────────────────────────────────────────────
-st.subheader(f"Open Positions  ({len(positions)})")
-
-if positions:
-    rows = []
-    for sym, pos in positions.items():
-        entry = pos.get("entry_price", 0)
-        current = pos.get("current_price", entry)
-        qty = pos.get("quantity", 0)
-        upnl = pos.get("unrealized_pnl", 0)
-        upnl_pct = (current - entry) / entry * 100 if entry else 0
-        rows.append({
-            "Symbol": sym,
-            "Side": pos.get("side", "LONG"),
-            "Qty": f"{qty:,}",
-            "Entry ฿": f"{entry:.2f}",
-            "Current ฿": f"{current:.2f}",
-            "Unreal P&L": upnl,
-            "P&L %": upnl_pct,
-            "Stop ฿": f"{pos.get('stop_loss', 0):.2f}",
-            "TP ฿": f"{pos.get('take_profit', 0):.2f}",
-            "Strategy": pos.get("strategy", ""),
-        })
-
-    df_pos = pd.DataFrame(rows)
-
-    def _color_pnl(val):
-        if isinstance(val, float):
-            color = "#50fa7b" if val >= 0 else "#ff5555"
-            return f"color: {color}"
-        return ""
-
-    st.dataframe(
-        df_pos.style
-            .applymap(_color_pnl, subset=["Unreal P&L", "P&L %"])
-            .format({"Unreal P&L": "฿{:,.2f}", "P&L %": "{:+.2f}%"}),
-        use_container_width=True,
-        hide_index=True,
+    unrealized_total = sum(p.get("unrealized_pnl", 0.0) for p in positions.values())
+    positions_value = sum(
+        p.get("quantity", 0) * p.get("current_price", p.get("entry_price", 0))
+        for p in positions.values()
     )
-else:
-    st.info("No open positions.")
+    total_equity = cash + positions_value
+    total_return_pct = (
+        (total_equity - initial_capital) / initial_capital * 100
+        if initial_capital > 0 else 0.0
+    )
+    wins = [t for t in closed_trades if t.get("pnl", 0) > 0]
+    win_rate = len(wins) / len(closed_trades) * 100 if closed_trades else 0.0
+    realized_pnl = sum(t.get("pnl", 0) for t in closed_trades)
 
-st.divider()
+    # KPI row
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total Equity", _fmt_thb(total_equity), f"{total_return_pct:+.2f}%")
+    c2.metric("Cash", _fmt_thb(cash))
+    c3.metric("Daily P&L", _fmt_thb(daily_pnl))
+    c4.metric("Unrealized P&L", _fmt_thb(unrealized_total))
+    c5.metric("Trades Today", str(daily_trades))
+    c6.metric("Win Rate", f"{win_rate:.1f}%", f"{len(wins)}/{len(closed_trades)}")
 
-# ── Trade History ──────────────────────────────────────────────────────────────
-col_hist, col_signals = st.columns([3, 2])
+    st.divider()
 
-with col_hist:
-    st.subheader("Recent Closed Trades")
-    if closed_trades:
-        df_trades = pd.DataFrame(closed_trades[::-1][:50])  # newest first
-        display_cols = ["symbol", "side", "entry_price", "exit_price",
-                        "quantity", "pnl", "pnl_pct", "strategy", "reason", "exit_time"]
-        df_trades = df_trades[[c for c in display_cols if c in df_trades.columns]]
-        df_trades.columns = [c.replace("_", " ").title() for c in df_trades.columns]
+    # Equity curve + trade bars
+    left, right = st.columns([3, 1])
 
-        def _color_row(row):
-            pnl_val = row.get("Pnl", row.get("P&L", 0))
-            color = "rgba(80,250,123,0.08)" if pnl_val > 0 else "rgba(255,85,85,0.08)"
-            return [f"background-color: {color}"] * len(row)
+    with left:
+        st.subheader("Equity Curve")
+        equity_history = state.get("equity_history", [])
+        if equity_history:
+            times = [row[0] for row in equity_history]
+            values = [row[1] for row in equity_history]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=times, y=values, mode="lines",
+                line=dict(color="#50fa7b", width=2),
+                fill="tozeroy", fillcolor="rgba(80,250,123,0.07)",
+            ))
+            if initial_capital:
+                fig.add_hline(y=initial_capital, line_dash="dash",
+                              line_color="#6272a4", annotation_text="Initial")
+            fig.update_layout(template="plotly_dark", height=320,
+                              margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No equity history yet.")
 
+    with right:
+        st.subheader("Trade P&L")
+        if closed_trades:
+            recent = closed_trades[-20:]
+            pnls = [t.get("pnl", 0) for t in recent]
+            syms = [t.get("symbol", "") for t in recent]
+            colors = ["#50fa7b" if p > 0 else "#ff5555" for p in pnls]
+            fig2 = go.Figure(go.Bar(x=list(range(len(pnls))), y=pnls,
+                                    marker_color=colors, text=syms))
+            fig2.update_layout(template="plotly_dark", height=320,
+                               margin=dict(l=0, r=0, t=10, b=0),
+                               xaxis=dict(showticklabels=False), showlegend=False)
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("No trades yet.")
+
+    st.divider()
+    st.subheader(f"Open Positions ({len(positions)})")
+    if positions:
+        rows = []
+        for sym, pos in positions.items():
+            entry = pos.get("entry_price", 0)
+            current = pos.get("current_price", entry)
+            rows.append({
+                "Symbol": sym, "Side": pos.get("side", "LONG"),
+                "Qty": f"{pos.get('quantity', 0):,}",
+                "Entry ฿": f"{entry:.2f}", "Current ฿": f"{current:.2f}",
+                "Unreal P&L": pos.get("unrealized_pnl", 0),
+                "P&L %": (current - entry) / entry * 100 if entry else 0,
+                "Stop ฿": f"{pos.get('stop_loss', 0):.2f}",
+                "TP ฿": f"{pos.get('take_profit', 0):.2f}",
+                "Strategy": pos.get("strategy", ""),
+            })
+        df_pos = pd.DataFrame(rows)
         st.dataframe(
-            df_trades.style
-                .apply(_color_row, axis=1)
-                .format({"Pnl": "฿{:,.2f}", "Pnl Pct": "{:+.2f}%"}, na_action="ignore"),
-            use_container_width=True,
-            hide_index=True,
-            height=350,
+            df_pos.style.format({"Unreal P&L": "฿{:,.2f}", "P&L %": "{:+.2f}%"}),
+            use_container_width=True, hide_index=True,
         )
     else:
-        st.info("No closed trades yet.")
+        st.info("No open positions.")
 
-# ── Signals Log ────────────────────────────────────────────────────────────────
-with col_signals:
-    st.subheader("Recent Signals")
-    signals_log = state.get("signals_log", [])
-    if signals_log:
-        df_sig = pd.DataFrame(signals_log[::-1])
-        df_sig["time"] = pd.to_datetime(df_sig["time"]).dt.strftime("%H:%M:%S")
-        df_sig.columns = [c.title() for c in df_sig.columns]
+    st.divider()
+    col_hist, col_signals = st.columns([3, 2])
+    with col_hist:
+        st.subheader("Recent Closed Trades")
+        if closed_trades:
+            df_t = pd.DataFrame(closed_trades[::-1][:50])
+            display_cols = ["symbol", "exit_price", "quantity", "pnl",
+                            "pnl_pct", "strategy", "reason", "exit_time"]
+            df_t = df_t[[c for c in display_cols if c in df_t.columns]]
+            st.dataframe(df_t, use_container_width=True, hide_index=True, height=350)
+        else:
+            st.info("No closed trades yet.")
 
-        def _sig_color(row):
-            color = (
-                "rgba(80,250,123,0.10)" if row.get("Type") == "BUY"
-                else "rgba(255,85,85,0.10)"
+    with col_signals:
+        st.subheader("Recent Signals")
+        signals_log = state.get("signals_log", [])
+        if signals_log:
+            df_s = pd.DataFrame(signals_log[::-1])
+            st.dataframe(df_s, use_container_width=True, hide_index=True, height=350)
+        else:
+            st.info("No signals yet.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACKTEST PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+_DEFAULT_WATCHLIST = [
+    "AOT", "ADVANC", "AWC", "BBL", "BDMS", "BEM", "BH", "CPALL", "CPF",
+    "CPN", "DELTA", "EA", "GULF", "HMPRO", "KBANK", "KTB", "MINT", "OR",
+    "PTT", "PTTEP", "SCB", "SCC", "SCGP", "TISCO", "TOP", "TRUE", "TTB", "TU",
+]
+
+_STRATEGY_MAP = {
+    "Composite (all signals)": "composite",
+    "Momentum (RSI + MACD)": "momentum",
+    "Mean Reversion (BB + RSI)": "mean_reversion",
+    "Breakout (Range + Volume)": "breakout",
+    "VWAP Deviation": "vwap",
+}
+
+
+def _build_strategy(name: str, cfg: StrategyConfig):
+    if name == "composite":
+        return CompositeStrategy(cfg)
+    if name == "momentum":
+        return MomentumStrategy(
+            rsi_period=cfg.momentum_rsi_period,
+            rsi_oversold=cfg.momentum_rsi_oversold,
+            rsi_overbought=cfg.momentum_rsi_overbought,
+            macd_fast=cfg.momentum_macd_fast,
+            macd_slow=cfg.momentum_macd_slow,
+            macd_signal=cfg.momentum_macd_signal,
+        )
+    if name == "mean_reversion":
+        return MeanReversionStrategy(
+            bb_period=cfg.mean_rev_bb_period,
+            bb_std=cfg.mean_rev_bb_std,
+            lookback=cfg.mean_rev_lookback,
+        )
+    if name == "breakout":
+        return BreakoutStrategy(
+            lookback=cfg.breakout_lookback,
+            volume_mult=cfg.breakout_volume_mult,
+            atr_period=cfg.breakout_atr_period,
+        )
+    if name == "vwap":
+        return VWAPStrategy(
+            deviation_entry=cfg.vwap_deviation_entry,
+            deviation_exit=cfg.vwap_deviation_exit,
+        )
+    return CompositeStrategy(cfg)
+
+
+@st.cache_data(show_spinner=False)
+def _load_data(symbol: str, data_source: str, bars: int,
+               base_price: float, volatility: float) -> pd.DataFrame:
+    settings = Settings.load()
+    fetcher = MarketDataFetcher(settings)
+    if data_source == "simulated":
+        return fetcher.generate_simulated_data(
+            symbol, bars=bars, base_price=base_price, volatility=volatility,
+        )
+    df = fetcher.get_historical_daily(symbol, days=max(bars // 5, 30))
+    if df.empty:
+        return fetcher.generate_simulated_data(
+            symbol, bars=bars, base_price=base_price, volatility=volatility,
+        )
+    return df
+
+
+def _plot_backtest(result: BacktestResult, df: pd.DataFrame):
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        subplot_titles=("Price & Trades", "Portfolio Equity"),
+    )
+
+    # Price candles
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index, open=df["open"], high=df["high"],
+            low=df["low"], close=df["close"],
+            increasing_line_color="#50fa7b", decreasing_line_color="#ff5555",
+            name="Price", showlegend=False,
+        ),
+        row=1, col=1,
+    )
+
+    # Trade markers
+    for t in result.trades:
+        entry_idx = t["entry_bar"]
+        exit_idx = t["exit_bar"]
+        if entry_idx < len(df) and exit_idx < len(df):
+            entry_time = df.index[entry_idx]
+            exit_time = df.index[exit_idx]
+            pnl_color = "#50fa7b" if t["pnl"] > 0 else "#ff5555"
+            fig.add_trace(
+                go.Scatter(
+                    x=[entry_time], y=[t["entry_price"]],
+                    mode="markers", marker=dict(symbol="triangle-up",
+                                                size=12, color="#8be9fd"),
+                    name="Entry", showlegend=False,
+                    hovertext=f"BUY @ ฿{t['entry_price']:.2f}",
+                ),
+                row=1, col=1,
             )
-            return [f"background-color: {color}"] * len(row)
+            fig.add_trace(
+                go.Scatter(
+                    x=[exit_time], y=[t["exit_price"]],
+                    mode="markers", marker=dict(symbol="triangle-down",
+                                                size=12, color=pnl_color),
+                    name="Exit", showlegend=False,
+                    hovertext=f"SELL @ ฿{t['exit_price']:.2f} | P&L: ฿{t['pnl']:,.2f}",
+                ),
+                row=1, col=1,
+            )
 
+    # Equity curve
+    if result.equity_curve:
+        eq_times = df.index[-len(result.equity_curve):]
+        fig.add_trace(
+            go.Scatter(
+                x=eq_times, y=result.equity_curve, mode="lines",
+                line=dict(color="#bd93f9", width=2),
+                fill="tozeroy", fillcolor="rgba(189,147,249,0.08)",
+                name="Equity", showlegend=False,
+            ),
+            row=2, col=1,
+        )
+        fig.add_hline(
+            y=result.initial_capital, line_dash="dash",
+            line_color="#6272a4", row=2, col=1,
+        )
+
+    fig.update_layout(
+        template="plotly_dark", height=620,
+        margin=dict(l=0, r=0, t=40, b=0),
+        xaxis_rangeslider_visible=False,
+    )
+    return fig
+
+
+def render_backtest():
+    st.header("🧪 Backtest")
+
+    # ── Config form ──────────────────────────────────────────────────────
+    with st.form("backtest_form", clear_on_submit=False):
+        cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
+        with cfg_col1:
+            symbol = st.selectbox(
+                "Symbol", _DEFAULT_WATCHLIST, index=0,
+                help="SET stock to backtest",
+            )
+            strategy_label = st.selectbox(
+                "Strategy", list(_STRATEGY_MAP.keys()), index=0,
+            )
+        with cfg_col2:
+            initial_capital = st.number_input(
+                "Initial Capital (฿)", min_value=10_000.0,
+                max_value=100_000_000.0, value=1_000_000.0, step=100_000.0,
+            )
+            bars = st.slider("Bars", min_value=100, max_value=1000, value=400, step=50)
+        with cfg_col3:
+            data_source = st.radio("Data source", ["simulated", "api"], index=0,
+                                   help="API needs Settrade credentials")
+            base_price = st.number_input("Base Price (฿) [sim only]",
+                                         min_value=1.0, value=100.0)
+            volatility = st.slider("Volatility [sim only]",
+                                   min_value=0.005, max_value=0.08,
+                                   value=0.02, step=0.005)
+
+        with st.expander("⚙️ Advanced Strategy Parameters"):
+            acol1, acol2, acol3 = st.columns(3)
+            with acol1:
+                rsi_period = st.number_input("RSI Period", 5, 30, 14)
+                rsi_oversold = st.number_input("RSI Oversold", 10.0, 50.0, 30.0)
+                rsi_overbought = st.number_input("RSI Overbought", 50.0, 90.0, 70.0)
+            with acol2:
+                bb_period = st.number_input("BB Period", 10, 50, 20)
+                bb_std = st.number_input("BB Std Dev", 1.0, 4.0, 2.0, step=0.1)
+                breakout_lookback = st.number_input("Breakout Lookback", 5, 50, 20)
+            with acol3:
+                vwap_dev = st.number_input("VWAP Deviation", 0.5, 4.0, 1.5, step=0.1)
+                min_signals = st.number_input("Min Signals (Composite)", 1, 4, 2)
+                volume_mult = st.number_input("Volume Multiplier", 1.0, 3.0, 1.5, step=0.1)
+
+        submitted = st.form_submit_button("▶️ Run Backtest", type="primary",
+                                          use_container_width=True)
+
+    if not submitted:
+        st.info("Configure parameters above and click **Run Backtest**.")
+        return
+
+    # ── Execute backtest ─────────────────────────────────────────────────
+    cfg = StrategyConfig()
+    cfg.momentum_rsi_period = int(rsi_period)
+    cfg.momentum_rsi_oversold = float(rsi_oversold)
+    cfg.momentum_rsi_overbought = float(rsi_overbought)
+    cfg.mean_rev_bb_period = int(bb_period)
+    cfg.mean_rev_bb_std = float(bb_std)
+    cfg.breakout_lookback = int(breakout_lookback)
+    cfg.breakout_volume_mult = float(volume_mult)
+    cfg.vwap_deviation_entry = float(vwap_dev)
+    cfg.min_signals_required = int(min_signals)
+
+    with st.spinner(f"Running backtest on {symbol}..."):
+        settings = Settings.load()
+        settings.trading.initial_capital = float(initial_capital)
+
+        df = _load_data(symbol, data_source, int(bars),
+                        float(base_price), float(volatility))
+        if df.empty:
+            st.error("Failed to load data.")
+            return
+
+        strategy_name = _STRATEGY_MAP[strategy_label]
+        strategy = _build_strategy(strategy_name, cfg)
+        engine = BacktestEngine(settings)
+        result = engine.run(df, strategy, symbol=symbol,
+                            initial_capital=float(initial_capital))
+
+    # ── Results: KPI cards ───────────────────────────────────────────────
+    st.success(f"Backtest complete: **{symbol}** / {strategy_label}")
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Total Return", f"{result.total_return_pct:+.2f}%",
+              _fmt_thb(result.total_return))
+    k2.metric("Sharpe Ratio", f"{result.sharpe_ratio:.2f}")
+    k3.metric("Max Drawdown", f"{result.max_drawdown:.2f}%")
+    pf_str = (f"{result.profit_factor:.2f}"
+              if result.profit_factor != float("inf") else "∞")
+    k4.metric("Profit Factor", pf_str)
+    k5.metric("Win Rate", f"{result.win_rate:.1f}%",
+              f"{result.winning_trades}W / {result.losing_trades}L")
+    k6.metric("Total Trades", str(result.total_trades))
+
+    k7, k8, k9, k10 = st.columns(4)
+    k7.metric("Final Capital", _fmt_thb(result.final_capital))
+    k8.metric("Avg Win", _fmt_thb(result.avg_win))
+    k9.metric("Avg Loss", _fmt_thb(result.avg_loss))
+    k10.metric("Avg Hold (bars)", f"{result.avg_holding_bars:.1f}")
+
+    st.divider()
+
+    # ── Chart ────────────────────────────────────────────────────────────
+    st.plotly_chart(_plot_backtest(result, df), use_container_width=True)
+
+    # ── Trade table ──────────────────────────────────────────────────────
+    st.subheader("Trade Log")
+    if result.trades:
+        df_tr = pd.DataFrame(result.trades)
+        df_tr["entry_time"] = df.index[df_tr["entry_bar"]].astype(str)
+        df_tr["exit_time"] = df.index[df_tr["exit_bar"]].astype(str)
+        df_tr = df_tr[["entry_time", "exit_time", "entry_price", "exit_price",
+                       "quantity", "pnl", "pnl_pct", "holding_bars",
+                       "exit_reason", "commission"]]
         st.dataframe(
-            df_sig.style.apply(_sig_color, axis=1),
-            use_container_width=True,
-            hide_index=True,
-            height=350,
+            df_tr.style.format({
+                "entry_price": "฿{:.2f}", "exit_price": "฿{:.2f}",
+                "quantity": "{:,}", "pnl": "฿{:,.2f}", "pnl_pct": "{:+.2f}%",
+                "commission": "฿{:,.2f}",
+            }),
+            use_container_width=True, hide_index=True, height=400,
+        )
+
+        # CSV export
+        csv = df_tr.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download Trades CSV", csv,
+            file_name=f"backtest_{symbol}_{strategy_name}.csv",
+            mime="text/csv",
         )
     else:
-        st.info("No signals logged yet.")
+        st.warning("No trades generated — try different parameters or a longer period.")
 
-st.divider()
 
-# ── Performance Stats ──────────────────────────────────────────────────────────
-st.subheader("Performance Statistics")
+# ═══════════════════════════════════════════════════════════════════════════════
+# SETTINGS PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+def render_settings():
+    st.header("⚙️ Settings")
+    settings = Settings.load()
 
-if closed_trades:
-    losses_list = [t for t in closed_trades if t.get("pnl", 0) <= 0]
-    gross_profit = sum(t.get("pnl", 0) for t in wins)
-    gross_loss = abs(sum(t.get("pnl", 0) for t in losses_list))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-    avg_win = gross_profit / len(wins) if wins else 0
-    avg_loss = gross_loss / len(losses_list) if losses_list else 0
-    largest_win = max((t.get("pnl", 0) for t in wins), default=0)
-    largest_loss = min((t.get("pnl", 0) for t in losses_list), default=0)
-    total_commission = sum(0.001578 * t.get("quantity", 0) * t.get("exit_price", 0)
-                           for t in closed_trades)
+    st.subheader("Trading")
+    c1, c2 = st.columns(2)
+    c1.metric("Initial Capital", _fmt_thb(settings.trading.initial_capital))
+    c1.metric("Primary Timeframe", settings.trading.primary_timeframe)
+    c1.metric("Commission Rate", f"{settings.trading.commission_rate * 100:.4f}%")
+    c2.metric("Market Open", settings.trading.market_open)
+    c2.metric("Market Close", settings.trading.market_close)
+    c2.metric("Slippage (bps)", f"{settings.trading.slippage_bps}")
 
-    sc1, sc2, sc3, sc4, sc5, sc6 = st.columns(6)
-    sc1.metric("Realized P&L", _fmt_thb(realized_pnl))
-    sc2.metric("Profit Factor", f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞")
-    sc3.metric("Avg Win", _fmt_thb(avg_win))
-    sc4.metric("Avg Loss", _fmt_thb(-avg_loss))
-    sc5.metric("Largest Win", _fmt_thb(largest_win))
-    sc6.metric("Largest Loss", _fmt_thb(largest_loss))
+    st.subheader("Risk")
+    r1, r2 = st.columns(2)
+    r1.metric("Max Position %", f"{settings.risk.max_position_pct * 100:.1f}%")
+    r1.metric("Max Daily Loss %", f"{settings.risk.max_daily_loss_pct * 100:.1f}%")
+    r1.metric("Max Open Positions", str(settings.risk.max_open_positions))
+    r2.metric("Stop Loss %", f"{settings.risk.stop_loss_pct * 100:.1f}%")
+    r2.metric("Take Profit %", f"{settings.risk.take_profit_pct * 100:.1f}%")
+    r2.metric("Sizing Method", settings.risk.position_size_method)
+
+    st.subheader("Watchlist")
+    wl_cols = st.columns(6)
+    for i, sym in enumerate(settings.trading.watchlist):
+        wl_cols[i % 6].markdown(f"`{sym}`")
+
+    st.info("Edit `config/settings.py` or `.env` to change these values.")
+
+
+# ── Route to page ──────────────────────────────────────────────────────────────
+if page.startswith("🔴"):
+    render_live()
+elif page.startswith("🧪"):
+    render_backtest()
 else:
-    st.info("Performance stats will appear after first closed trade.")
-
-# ── Strategy breakdown donut ───────────────────────────────────────────────────
-if closed_trades:
-    st.subheader("P&L by Strategy")
-    strategy_pnl: dict[str, float] = {}
-    for t in closed_trades:
-        strat = t.get("strategy", "unknown")
-        strategy_pnl[strat] = strategy_pnl.get(strat, 0) + t.get("pnl", 0)
-
-    if strategy_pnl:
-        labels = list(strategy_pnl.keys())
-        values = [abs(v) for v in strategy_pnl.values()]
-        colors_pie = ["#50fa7b" if strategy_pnl[l] >= 0 else "#ff5555" for l in labels]
-
-        fig3 = go.Figure(go.Pie(
-            labels=labels,
-            values=values,
-            hole=0.5,
-            marker_colors=colors_pie,
-            textinfo="label+percent",
-        ))
-        fig3.update_layout(
-            template="plotly_dark",
-            height=280,
-            margin=dict(l=0, r=0, t=10, b=0),
-            showlegend=True,
-        )
-        st.plotly_chart(fig3, use_container_width=True)
+    render_settings()
