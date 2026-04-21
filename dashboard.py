@@ -17,12 +17,14 @@ import streamlit as st
 from config.settings import Settings, StrategyConfig
 from data.market_data import MarketDataFetcher
 from backtest.engine import BacktestEngine, BacktestResult
+from engine import risk_metrics
 from strategies.composite import CompositeStrategy
 from strategies.momentum import MomentumStrategy
 from strategies.mean_reversion import MeanReversionStrategy
 from strategies.breakout import BreakoutStrategy
 from strategies.vwap_strategy import VWAPStrategy
 from utils import state_store
+from utils.helpers import get_tick_size, round_to_tick, calculate_commission
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -55,7 +57,8 @@ def _fmt_thb(v: float) -> str:
 # ── Sidebar: navigation ────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📈 SetseekerBot")
-    page = st.radio("Navigation", ["🔴 Live Trading", "🧪 Backtest", "⚙️ Settings"],
+    page = st.radio("Navigation",
+                    ["🔴 Live Trading", "🧪 Backtest", "🛡️ Risk Management", "⚙️ Settings"],
                     label_visibility="collapsed")
 
     st.divider()
@@ -475,6 +478,348 @@ def render_backtest():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# RISK MANAGEMENT PAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+def _limit_bar(label: str, used_pct: float, limit_desc: str):
+    """Render a colored progress bar for a risk limit."""
+    if used_pct >= 100:
+        color = "#ff5555"      # Red — breached
+        status = "⚠️ BREACHED"
+    elif used_pct >= 75:
+        color = "#ffb86c"      # Orange — warning
+        status = "⚡ Warning"
+    elif used_pct >= 50:
+        color = "#f1fa8c"      # Yellow — caution
+        status = "Caution"
+    else:
+        color = "#50fa7b"      # Green — safe
+        status = "✓ Safe"
+
+    pct_display = min(used_pct, 100)
+    st.markdown(
+        f"""
+        <div style="margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+            <span><b>{label}</b> <span style="color: #888; font-size: 0.85em;">({limit_desc})</span></span>
+            <span style="color: {color};">{used_pct:.1f}% — {status}</span>
+          </div>
+          <div style="background: #282a36; border-radius: 4px; height: 10px; overflow: hidden;">
+            <div style="width: {pct_display}%; height: 100%; background: {color};
+                        transition: width 0.3s ease;"></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_risk():
+    st.header("🛡️ Risk Management")
+
+    settings = Settings.load()
+
+    # Allow user overrides via session state
+    if "risk_overrides" not in st.session_state:
+        st.session_state.risk_overrides = {
+            "max_position_pct": settings.risk.max_position_pct,
+            "max_daily_loss_pct": settings.risk.max_daily_loss_pct,
+            "max_open_positions": settings.risk.max_open_positions,
+            "max_drawdown_pct": settings.risk.max_drawdown_pct,
+            "stop_loss_pct": settings.risk.stop_loss_pct,
+            "take_profit_pct": settings.risk.take_profit_pct,
+            "trailing_stop_pct": settings.risk.trailing_stop_pct,
+            "sizing_method": settings.risk.position_size_method,
+        }
+    r = st.session_state.risk_overrides
+
+    summary = risk_metrics.compute_risk_summary(
+        state,
+        initial_capital=state.get("initial_capital", settings.trading.initial_capital),
+        max_daily_loss_pct=r["max_daily_loss_pct"],
+        max_drawdown_pct=r["max_drawdown_pct"],
+        max_position_pct=r["max_position_pct"],
+        max_open_positions=r["max_open_positions"],
+    )
+
+    # ── KPI Row ──────────────────────────────────────────────────────────
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Total Equity", _fmt_thb(summary["total_equity"]))
+    k2.metric("Current Drawdown",
+              f"{summary['current_drawdown_pct']:.2f}%",
+              f"Max: {summary['max_drawdown_pct']:.2f}%",
+              delta_color="inverse")
+    k3.metric("VaR (95%)",
+              f"{summary['var_95']:.2f}%",
+              _fmt_thb(summary['var_95_amount']),
+              delta_color="inverse")
+    k4.metric("CVaR (95%)", f"{summary['cvar_95']:.2f}%", delta_color="inverse")
+    k5.metric("Total Risk",
+              _fmt_thb(summary["total_risk_amount"]),
+              f"{summary['total_risk_pct']:.2f}% of equity")
+    k6.metric("Risk of Ruin",
+              f"{summary['risk_of_ruin_pct']:.2f}%",
+              "at 1% risk/trade",
+              delta_color="inverse")
+
+    st.divider()
+
+    # ── Risk Limits Utilization ─────────────────────────────────────────
+    col_limits, col_concentration = st.columns([3, 2])
+
+    with col_limits:
+        st.subheader("Risk Limits — Utilization")
+        _limit_bar(
+            "Daily Loss",
+            summary["daily_loss_used_pct"],
+            f"Limit: {_fmt_thb(summary['daily_loss_limit'])} "
+            f"| Used: {_fmt_thb(max(0, -summary['daily_pnl']))}",
+        )
+        _limit_bar(
+            "Drawdown",
+            summary["drawdown_used_pct"],
+            f"Limit: {r['max_drawdown_pct'] * 100:.1f}% "
+            f"| Current: {summary['current_drawdown_pct']:.2f}%",
+        )
+        _limit_bar(
+            "Open Positions",
+            summary["positions_used_pct"],
+            f"Limit: {r['max_open_positions']} "
+            f"| Current: {summary['num_positions']}",
+        )
+        _limit_bar(
+            "Largest Position",
+            summary["largest_position_pct"] / (r["max_position_pct"] * 100) * 100
+            if r["max_position_pct"] > 0 else 0,
+            f"Limit: {r['max_position_pct'] * 100:.1f}% "
+            f"| Largest: {summary['largest_position_pct']:.1f}%",
+        )
+
+    with col_concentration:
+        st.subheader("Position Concentration")
+        if summary["concentration"]:
+            labels = [r["symbol"] for r in summary["concentration"]]
+            weights = [r["weight_pct"] for r in summary["concentration"]]
+            cash_weight = (summary["cash"] / summary["total_equity"] * 100
+                           if summary["total_equity"] > 0 else 100)
+            labels.append("Cash")
+            weights.append(cash_weight)
+            colors = ["#ff5555", "#ff79c6", "#bd93f9", "#8be9fd",
+                      "#50fa7b", "#f1fa8c", "#ffb86c"] * 3
+            fig = go.Figure(go.Pie(
+                labels=labels, values=weights, hole=0.55,
+                marker_colors=colors[:len(labels)],
+                textinfo="label+percent",
+            ))
+            fig.update_layout(template="plotly_dark", height=320,
+                              margin=dict(l=0, r=0, t=0, b=0),
+                              showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No open positions.")
+
+    st.divider()
+
+    # ── Drawdown chart ──────────────────────────────────────────────────
+    st.subheader("Drawdown History")
+    if summary["drawdown_series"] and summary["equity_timestamps"]:
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=summary["equity_timestamps"],
+            y=[-d for d in summary["drawdown_series"]],
+            mode="lines",
+            line=dict(color="#ff5555", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(255,85,85,0.15)",
+            name="Drawdown %",
+        ))
+        fig_dd.add_hline(
+            y=-r["max_drawdown_pct"] * 100,
+            line_dash="dash", line_color="#ff5555",
+            annotation_text=f"Limit: -{r['max_drawdown_pct'] * 100:.1f}%",
+        )
+        fig_dd.update_layout(
+            template="plotly_dark", height=260,
+            margin=dict(l=0, r=0, t=10, b=0),
+            yaxis_title="Drawdown %",
+            xaxis_title=None, showlegend=False,
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+    else:
+        st.info("Drawdown chart will appear once equity history is populated.")
+
+    st.divider()
+
+    # ── Position risk table ─────────────────────────────────────────────
+    st.subheader("Per-Position Risk Breakdown")
+    if summary["concentration"]:
+        df_risk = pd.DataFrame(summary["concentration"])
+        df_risk = df_risk.rename(columns={
+            "symbol": "Symbol",
+            "market_value": "Market Value",
+            "weight_pct": "Weight %",
+            "unrealized_pnl": "Unreal P&L",
+            "side": "Side",
+            "risk_amount": "Risk to Stop",
+        })
+        st.dataframe(
+            df_risk.style.format({
+                "Market Value": "฿{:,.2f}",
+                "Weight %": "{:.2f}%",
+                "Unreal P&L": "฿{:,.2f}",
+                "Risk to Stop": "฿{:,.2f}",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("No open positions to analyze.")
+
+    st.divider()
+
+    # ── Pre-Trade Risk Calculator ───────────────────────────────────────
+    st.subheader("🧮 Pre-Trade Risk Calculator")
+    st.caption("Evaluate position size & risk before entering a trade.")
+
+    with st.form("risk_calc"):
+        calc_col1, calc_col2, calc_col3 = st.columns(3)
+        with calc_col1:
+            calc_symbol = st.text_input("Symbol", value="ADVANC")
+            calc_entry = st.number_input("Entry Price (฿)",
+                                         min_value=0.01, value=250.0, step=0.5)
+            calc_stop = st.number_input("Stop Loss (฿)",
+                                        min_value=0.0, value=245.0, step=0.5)
+        with calc_col2:
+            calc_target = st.number_input("Take Profit (฿)",
+                                          min_value=0.0, value=260.0, step=0.5)
+            calc_equity = st.number_input(
+                "Account Equity (฿)", min_value=10_000.0,
+                value=float(summary["total_equity"])
+                if summary["total_equity"] > 0 else 1_000_000.0,
+                step=10_000.0,
+            )
+            calc_risk_pct = st.slider("Risk per Trade (%)",
+                                      min_value=0.25, max_value=5.0,
+                                      value=1.0, step=0.25)
+        with calc_col3:
+            calc_win_prob = st.slider("Win Probability (%)",
+                                      min_value=30.0, max_value=80.0,
+                                      value=55.0, step=2.5)
+            calc_method = st.radio("Sizing Method",
+                                   ["Fixed %", "Kelly (half)", "Volatility"])
+            calc_side = st.radio("Side", ["BUY (long)", "SELL (short)"])
+
+        calc_submitted = st.form_submit_button("📊 Calculate", type="primary",
+                                               use_container_width=True)
+
+    if calc_submitted:
+        side = "BUY" if calc_side.startswith("BUY") else "SELL"
+        if side == "BUY":
+            risk_per_share = max(calc_entry - calc_stop, 0.0001)
+            reward_per_share = max(calc_target - calc_entry, 0.0)
+        else:
+            risk_per_share = max(calc_stop - calc_entry, 0.0001)
+            reward_per_share = max(calc_entry - calc_target, 0.0)
+
+        rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0
+        risk_budget = calc_equity * calc_risk_pct / 100
+
+        if calc_method == "Fixed %":
+            shares = int(risk_budget / risk_per_share)
+        elif calc_method == "Kelly (half)":
+            wp = calc_win_prob / 100
+            b = rr_ratio
+            kelly = (b * wp - (1 - wp)) / b if b > 0 else 0
+            kelly = max(0, kelly * 0.5)
+            kelly_value = calc_equity * kelly
+            shares = int(kelly_value / calc_entry)
+        else:
+            # Volatility = 2x risk_per_share as proxy
+            shares = int(risk_budget / (2 * risk_per_share))
+
+        shares = (shares // 100) * 100  # SET 100-lot
+        position_value = shares * calc_entry
+        position_pct = position_value / calc_equity * 100 if calc_equity else 0
+        total_risk = shares * risk_per_share
+        total_reward = shares * reward_per_share
+        commission = calculate_commission(position_value * 2)
+
+        expected_value = (
+            (calc_win_prob / 100) * total_reward
+            - (1 - calc_win_prob / 100) * total_risk
+            - commission
+        )
+
+        # Checks
+        alerts = []
+        if position_pct > r["max_position_pct"] * 100:
+            alerts.append(f"⚠️ Exceeds max position size "
+                          f"({r['max_position_pct'] * 100:.1f}%)")
+        if rr_ratio < 1.5:
+            alerts.append(f"⚠️ Risk/reward ratio too low ({rr_ratio:.2f} < 1.5)")
+        if risk_per_share == 0.0001:
+            alerts.append("⚠️ Stop-loss is at or beyond entry price")
+        if shares <= 0:
+            alerts.append("⚠️ Position size too small (< 100 shares)")
+
+        # Output
+        st.markdown("### Results")
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Recommended Shares", f"{shares:,}")
+        rc2.metric("Position Value", _fmt_thb(position_value),
+                   f"{position_pct:.2f}% of equity")
+        rc3.metric("Total Risk", _fmt_thb(total_risk))
+        rc4.metric("R/R Ratio", f"{rr_ratio:.2f}")
+
+        rc5, rc6, rc7, rc8 = st.columns(4)
+        rc5.metric("Potential Reward", _fmt_thb(total_reward))
+        rc6.metric("Expected Value", _fmt_thb(expected_value),
+                   delta_color="normal")
+        rc7.metric("Round-trip Commission", _fmt_thb(commission))
+        rc8.metric("Risk/Share", _fmt_thb(risk_per_share))
+
+        if alerts:
+            for a in alerts:
+                st.warning(a)
+        else:
+            st.success("✅ Trade passes all risk checks.")
+
+    st.divider()
+
+    # ── Risk Limits Editor ──────────────────────────────────────────────
+    st.subheader("⚙️ Risk Limits Editor")
+    st.caption("Changes apply to this dashboard session. Edit `config/settings.py` for persistence.")
+
+    with st.form("risk_limits_editor"):
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            new_max_pos = st.slider("Max Position %", 1.0, 50.0,
+                                    r["max_position_pct"] * 100, 1.0) / 100
+            new_max_daily = st.slider("Max Daily Loss %", 0.5, 10.0,
+                                      r["max_daily_loss_pct"] * 100, 0.25) / 100
+        with e2:
+            new_max_dd = st.slider("Max Drawdown %", 1.0, 30.0,
+                                   r["max_drawdown_pct"] * 100, 0.5) / 100
+            new_max_openp = st.slider("Max Open Positions", 1, 20,
+                                      r["max_open_positions"], 1)
+        with e3:
+            new_sl = st.slider("Default Stop Loss %", 0.5, 10.0,
+                               r["stop_loss_pct"] * 100, 0.25) / 100
+            new_tp = st.slider("Default Take Profit %", 0.5, 20.0,
+                               r["take_profit_pct"] * 100, 0.25) / 100
+
+        if st.form_submit_button("💾 Save Overrides", type="primary"):
+            st.session_state.risk_overrides.update({
+                "max_position_pct": new_max_pos,
+                "max_daily_loss_pct": new_max_daily,
+                "max_drawdown_pct": new_max_dd,
+                "max_open_positions": int(new_max_openp),
+                "stop_loss_pct": new_sl,
+                "take_profit_pct": new_tp,
+            })
+            st.success("Risk limits updated for this session.")
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SETTINGS PAGE
 # ═══════════════════════════════════════════════════════════════════════════════
 def render_settings():
@@ -512,5 +857,7 @@ if page.startswith("🔴"):
     render_live()
 elif page.startswith("🧪"):
     render_backtest()
+elif page.startswith("🛡️"):
+    render_risk()
 else:
     render_settings()
