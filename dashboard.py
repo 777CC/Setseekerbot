@@ -54,6 +54,15 @@ def _fmt_thb(v: float) -> str:
     return f"฿{v:,.2f}"
 
 
+_SETTRADE_URL = "https://www.settrade.com/th/equities/quote/{symbol}/overview"
+
+
+def _sym_link(symbol: str) -> str:
+    """Return an HTML link that opens the Settrade quote page in a new tab."""
+    url = _SETTRADE_URL.format(symbol=symbol)
+    return f'<a href="{url}" target="_blank" style="color:#8be9fd;text-decoration:none;font-weight:bold;">{symbol} ↗</a>'
+
+
 # ── Sidebar: navigation ────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📈 SetseekerBot")
@@ -159,25 +168,32 @@ def render_live():
     st.divider()
     st.subheader(f"Open Positions ({len(positions)})")
     if positions:
-        rows = []
+        pos_html = "<table style='width:100%;border-collapse:collapse;'>"
+        pos_html += ("<tr style='border-bottom:1px solid #444;'>"
+                     "<th style='text-align:left;padding:6px;'>Symbol</th>"
+                     "<th>Qty</th><th>Entry ฿</th><th>Current ฿</th>"
+                     "<th>P&L</th><th>P&L %</th><th>SL</th><th>TP</th>"
+                     "<th>Strategy</th></tr>")
         for sym, pos in positions.items():
             entry = pos.get("entry_price", 0)
             current = pos.get("current_price", entry)
-            rows.append({
-                "Symbol": sym, "Side": pos.get("side", "LONG"),
-                "Qty": f"{pos.get('quantity', 0):,}",
-                "Entry ฿": f"{entry:.2f}", "Current ฿": f"{current:.2f}",
-                "Unreal P&L": pos.get("unrealized_pnl", 0),
-                "P&L %": (current - entry) / entry * 100 if entry else 0,
-                "Stop ฿": f"{pos.get('stop_loss', 0):.2f}",
-                "TP ฿": f"{pos.get('take_profit', 0):.2f}",
-                "Strategy": pos.get("strategy", ""),
-            })
-        df_pos = pd.DataFrame(rows)
-        st.dataframe(
-            df_pos.style.format({"Unreal P&L": "฿{:,.2f}", "P&L %": "{:+.2f}%"}),
-            use_container_width=True, hide_index=True,
-        )
+            upnl = pos.get("unrealized_pnl", 0)
+            pnl_pct = (current - entry) / entry * 100 if entry else 0
+            pnl_color = "#50fa7b" if upnl >= 0 else "#ff5555"
+            pos_html += (
+                f"<tr style='border-bottom:1px solid #333;'>"
+                f"<td style='padding:6px;'>{_sym_link(sym)}</td>"
+                f"<td style='text-align:right;'>{pos.get('quantity', 0):,}</td>"
+                f"<td style='text-align:right;'>{entry:.2f}</td>"
+                f"<td style='text-align:right;'>{current:.2f}</td>"
+                f"<td style='text-align:right;color:{pnl_color};'>฿{upnl:,.2f}</td>"
+                f"<td style='text-align:right;color:{pnl_color};'>{pnl_pct:+.2f}%</td>"
+                f"<td style='text-align:right;'>{pos.get('stop_loss', 0):.2f}</td>"
+                f"<td style='text-align:right;'>{pos.get('take_profit', 0):.2f}</td>"
+                f"<td>{pos.get('strategy', '')}</td></tr>"
+            )
+        pos_html += "</table>"
+        st.markdown(pos_html, unsafe_allow_html=True)
     else:
         st.info("No open positions.")
 
@@ -186,11 +202,31 @@ def render_live():
     with col_hist:
         st.subheader("Recent Closed Trades")
         if closed_trades:
-            df_t = pd.DataFrame(closed_trades[::-1][:50])
-            display_cols = ["symbol", "exit_price", "quantity", "pnl",
-                            "pnl_pct", "strategy", "reason", "exit_time"]
-            df_t = df_t[[c for c in display_cols if c in df_t.columns]]
-            st.dataframe(df_t, use_container_width=True, hide_index=True, height=350)
+            recent = closed_trades[::-1][:50]
+            ct_html = "<table style='width:100%;border-collapse:collapse;font-size:0.9em;'>"
+            ct_html += ("<tr style='border-bottom:1px solid #444;'>"
+                        "<th style='text-align:left;padding:4px;'>Symbol</th>"
+                        "<th>Exit ฿</th><th>Qty</th><th>P&L</th>"
+                        "<th>P&L %</th><th>Strategy</th><th>Time</th></tr>")
+            for t in recent:
+                pnl = t.get("pnl", 0)
+                pnl_color = "#50fa7b" if pnl >= 0 else "#ff5555"
+                sym = t.get("symbol", "")
+                exit_time = t.get("exit_time", "")
+                if isinstance(exit_time, str) and len(exit_time) > 16:
+                    exit_time = exit_time[:16]
+                ct_html += (
+                    f"<tr style='border-bottom:1px solid #333;'>"
+                    f"<td style='padding:4px;'>{_sym_link(sym)}</td>"
+                    f"<td style='text-align:right;'>{t.get('exit_price', 0):.2f}</td>"
+                    f"<td style='text-align:right;'>{t.get('quantity', 0):,}</td>"
+                    f"<td style='text-align:right;color:{pnl_color};'>฿{pnl:,.2f}</td>"
+                    f"<td style='text-align:right;color:{pnl_color};'>{t.get('pnl_pct', 0):+.2f}%</td>"
+                    f"<td>{t.get('strategy', '')}</td>"
+                    f"<td>{exit_time}</td></tr>"
+                )
+            ct_html += "</table>"
+            st.markdown(ct_html, unsafe_allow_html=True)
         else:
             st.info("No closed trades yet.")
 
@@ -198,8 +234,29 @@ def render_live():
         st.subheader("Recent Signals")
         signals_log = state.get("signals_log", [])
         if signals_log:
-            df_s = pd.DataFrame(signals_log[::-1])
-            st.dataframe(df_s, use_container_width=True, hide_index=True, height=350)
+            sig_html = "<table style='width:100%;border-collapse:collapse;font-size:0.9em;'>"
+            sig_html += ("<tr style='border-bottom:1px solid #444;'>"
+                         "<th style='text-align:left;padding:4px;'>Time</th>"
+                         "<th>Symbol</th><th>Type</th>"
+                         "<th>Price</th><th>Str</th><th>Reason</th></tr>")
+            for s in signals_log[::-1]:
+                sym = s.get("symbol", "")
+                sig_type = s.get("type", "")
+                type_color = "#50fa7b" if sig_type == "BUY" else "#ff5555"
+                sig_time = s.get("time", "")
+                if isinstance(sig_time, str) and len(sig_time) > 19:
+                    sig_time = sig_time[11:19]
+                sig_html += (
+                    f"<tr style='border-bottom:1px solid #333;'>"
+                    f"<td style='padding:4px;'>{sig_time}</td>"
+                    f"<td>{_sym_link(sym)}</td>"
+                    f"<td style='color:{type_color};font-weight:bold;'>{sig_type}</td>"
+                    f"<td style='text-align:right;'>฿{s.get('price', 0):.2f}</td>"
+                    f"<td style='text-align:right;'>{s.get('strength', 0):.2f}</td>"
+                    f"<td style='font-size:0.85em;'>{s.get('reason', '')[:60]}</td></tr>"
+                )
+            sig_html += "</table>"
+            st.markdown(sig_html, unsafe_allow_html=True)
         else:
             st.info("No signals yet.")
 
@@ -652,24 +709,26 @@ def render_risk():
     # ── Position risk table ─────────────────────────────────────────────
     st.subheader("Per-Position Risk Breakdown")
     if summary["concentration"]:
-        df_risk = pd.DataFrame(summary["concentration"])
-        df_risk = df_risk.rename(columns={
-            "symbol": "Symbol",
-            "market_value": "Market Value",
-            "weight_pct": "Weight %",
-            "unrealized_pnl": "Unreal P&L",
-            "side": "Side",
-            "risk_amount": "Risk to Stop",
-        })
-        st.dataframe(
-            df_risk.style.format({
-                "Market Value": "฿{:,.2f}",
-                "Weight %": "{:.2f}%",
-                "Unreal P&L": "฿{:,.2f}",
-                "Risk to Stop": "฿{:,.2f}",
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        risk_html = "<table style='width:100%;border-collapse:collapse;'>"
+        risk_html += ("<tr style='border-bottom:1px solid #444;'>"
+                      "<th style='text-align:left;padding:6px;'>Symbol</th>"
+                      "<th>Side</th><th>Market Value</th><th>Weight %</th>"
+                      "<th>Unreal P&L</th><th>Risk to Stop</th></tr>")
+        for r_item in summary["concentration"]:
+            sym = r_item["symbol"]
+            upnl = r_item["unrealized_pnl"]
+            pnl_color = "#50fa7b" if upnl >= 0 else "#ff5555"
+            risk_html += (
+                f"<tr style='border-bottom:1px solid #333;'>"
+                f"<td style='padding:6px;'>{_sym_link(sym)}</td>"
+                f"<td>{r_item['side']}</td>"
+                f"<td style='text-align:right;'>฿{r_item['market_value']:,.2f}</td>"
+                f"<td style='text-align:right;'>{r_item['weight_pct']:.2f}%</td>"
+                f"<td style='text-align:right;color:{pnl_color};'>฿{upnl:,.2f}</td>"
+                f"<td style='text-align:right;'>฿{r_item['risk_amount']:,.2f}</td></tr>"
+            )
+        risk_html += "</table>"
+        st.markdown(risk_html, unsafe_allow_html=True)
     else:
         st.info("No open positions to analyze.")
 
@@ -847,7 +906,7 @@ def render_settings():
     st.subheader("Watchlist")
     wl_cols = st.columns(6)
     for i, sym in enumerate(settings.trading.watchlist):
-        wl_cols[i % 6].markdown(f"`{sym}`")
+        wl_cols[i % 6].markdown(_sym_link(sym), unsafe_allow_html=True)
 
     st.info("Edit `config/settings.py` or `.env` to change these values.")
 
